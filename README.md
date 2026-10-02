@@ -39,7 +39,7 @@ These results are significant for two reasons:
 The engine processes a combinatorial search space of approximately **4.38 trillion
 possibilities**. On a low-power **Intel Core i3-N305** with eight Gracemont E-cores, a reported
 full run completed in approximately **649 seconds**, while the optimized hot path reached a
-reported peak throughput of about **10.5 billion combinations per second**.
+reported peak throughput of about **21.5 billion combinations per second**.
 
 > These records and performance figures are project results for the configured search bounds.
 > The first record is present in the project's discovery history; the second was supplied as a
