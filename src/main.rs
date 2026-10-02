@@ -2219,7 +2219,8 @@ fn main() {
                     theoretical: theoretical_per_b,
                     ..StageCounts::default()
                 };
-                let mut comb_acc = CandidateAccumulator::with_target(BATCH_SIZE, &TOTAL_COMBINATIONS);
+                let mut comb_acc =
+                    CandidateAccumulator::with_target(BATCH_SIZE, &TOTAL_COMBINATIONS);
                 let mut cand_acc = CandidateAccumulator::with_target(BATCH_SIZE, &TOTAL_CANDIDATES);
                 let mut done_comb_in_b: u64 = 0;
                 let b_residue = b_residues[b_idx];
@@ -2251,7 +2252,8 @@ fn main() {
 
                     while c <= C_MAX {
                         counts.parity_crt_points += 1;
-                        let step_comb = (6 * total_d).min(theoretical_per_b.saturating_sub(done_comb_in_b));
+                        let step_comb =
+                            (6 * total_d).min(theoretical_per_b.saturating_sub(done_comb_in_b));
                         done_comb_in_b += step_comb;
                         comb_acc.record_n(step_comb);
 
@@ -2321,7 +2323,8 @@ fn main() {
 
                     while c <= C_MAX {
                         counts.parity_crt_points += 1;
-                        let step_comb = (2 * total_d).min(theoretical_per_b.saturating_sub(done_comb_in_b));
+                        let step_comb =
+                            (2 * total_d).min(theoretical_per_b.saturating_sub(done_comb_in_b));
                         done_comb_in_b += step_comb;
                         comb_acc.record_n(step_comb);
 
@@ -2383,7 +2386,10 @@ fn main() {
             })
             .reduce(StageCounts::default, |left, right| left + right);
 
-        TOTAL_THEORETICAL.store(TOTAL_COMBINATIONS.load(Ordering::Relaxed), Ordering::Relaxed);
+        TOTAL_THEORETICAL.store(
+            TOTAL_COMBINATIONS.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         TOTAL_TESTED.store(TOTAL_CANDIDATES.load(Ordering::Relaxed), Ordering::Relaxed);
         COMPLETED_A.fetch_add(1, Ordering::Relaxed);
 
@@ -3750,8 +3756,8 @@ mod tests {
     #[test]
     fn test_miller_rabin_small_primes_and_composites() {
         let primes = [
-            2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79,
-            83, 89, 97,
+            2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83,
+            89, 97,
         ];
         for &p in &primes {
             assert!(is_prime_miller_rabin(p), "{} should be prime", p);
