@@ -31,7 +31,7 @@ pub const D_MAX: usize = 10000;
 
 pub const BACKWARD_SEARCH_THRESHOLD: usize = 10;
 pub const LOCAL_RECORD_THRESHOLD: usize = 36;
-pub const WORLD_RECORD_THRESHOLD: usize = 37;
+pub const WORLD_RECORD_THRESHOLD: usize = 45;
 
 pub const BATCH_SIZE: u64 = 10_000_000;
 pub const HEARTBEAT_INTERVAL: u64 = 10_000_000_000;

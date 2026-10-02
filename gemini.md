@@ -10,7 +10,7 @@ Welcome to `prime_hunter`. This document provides a complete technical, mathemat
 
 $$f(n) = a n^3 + b n^2 + c n + d \quad (a, b, c, d \in \mathbb{Z}, \; a \neq 0)$$
 
-that generate long consecutive streaks of prime numbers for consecutive non-negative integers $n = 0, 1, 2, \dots, L - 1$. The goal is to maximize the run length $L$, hunting for local records ($L \ge 36$) and potential world records ($L \ge 37$).
+that generate long consecutive streaks of prime numbers for consecutive non-negative integers $n = 0, 1, 2, \dots, L - 1$. The goal is to maximize the run length $L$, hunting for local records ($L \ge 36$) and potential world records ($L \ge 45$).
 
 ### Mathematical Rigor & Optimizations
 
@@ -389,7 +389,7 @@ Located in [`src/main.rs`](file:///home/teto/Documents/GitHub/math/prime_hunter/
 | `D_MIN`, `D_MAX` | `29`, `10000` | $d$ odd primes in $[29, 10000]$ ($1,220$ primes, $d \le 23$ culled) |
 | `BACKWARD_SEARCH_THRESHOLD` | `10` | Minimum forward streak length to trigger backward extension check ($n < 0$). Lowered to 10 (V2) to catch asymmetric straddling records where the forward reach is short. |
 | `LOCAL_RECORD_THRESHOLD` | `36` | Minimum streak length to trigger console discovery and append to `discoveries.txt` |
-| `WORLD_RECORD_THRESHOLD` | `37` | Minimum streak length to trigger world record banner |
+| `WORLD_RECORD_THRESHOLD` | `45` | Minimum streak length to trigger world record banner |
 | `SIEVE_LIMIT` | `100_000_000` | Upper limit of Tier 2 prime sieve |
 | `L1_LIMIT` | `32_768` | Upper limit of Tier 1 L1-resident byte table |
 | `L1_SIZE` | `16_384` | Size of Tier 1 L1 byte table ($16\text{ KiB}$) |
