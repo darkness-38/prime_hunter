@@ -1,6 +1,6 @@
 use primal::Sieve;
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Write, stdout};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -44,6 +44,9 @@ pub const SIEVE_LIMIT: usize = 100_000_000;
 pub const L1_LIMIT: usize = 32_768;
 pub const L1_SIZE: usize = L1_LIMIT / 2; // 16,384 bytes
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const MASK_RESIDUE_PERIOD: usize = 210;
+const MOD35_B_RESIDUE_COUNT: usize = MASK_RESIDUE_PERIOD / 3;
+const MOD105_B_RESIDUE_COUNT: usize = MASK_RESIDUE_PERIOD - MOD35_B_RESIDUE_COUNT;
 // Static compile-time assertions proving bounds cannot overflow i64 up to n = 1000
 const fn static_check_no_overflow() -> bool {
     const N: i64 = 1000;
@@ -286,6 +289,119 @@ impl Mod105Buckets {
             valid_mod7,
         }
     }
+}
+
+pub struct PeriodicMaskCache {
+    mod35: Box<[u16]>,
+    mod105: Box<[u16]>,
+    mask_values: Box<[u128]>,
+    non_mod3_b_index: [usize; MASK_RESIDUE_PERIOD],
+}
+
+impl PeriodicMaskCache {
+    pub fn new(buckets: &Mod105Buckets) -> Self {
+        let mut mod35 =
+            vec![0u16; MASK_RESIDUE_PERIOD * MOD35_B_RESIDUE_COUNT * 35].into_boxed_slice();
+        let mut mod105 =
+            vec![0u16; MASK_RESIDUE_PERIOD * MOD105_B_RESIDUE_COUNT * 105].into_boxed_slice();
+        let mut mask_values = Vec::new();
+        let mut mask_ids = HashMap::new();
+        let mut non_mod3_b_index = [0usize; MASK_RESIDUE_PERIOD];
+        let mut next_non_mod3_index = 0;
+
+        for (b_residue, index) in non_mod3_b_index.iter_mut().enumerate() {
+            if b_residue % 3 != 0 {
+                *index = next_non_mod3_index;
+                next_non_mod3_index += 1;
+            }
+        }
+
+        for a_residue in 0..MASK_RESIDUE_PERIOD {
+            for b_residue in (0..MASK_RESIDUE_PERIOD).step_by(3) {
+                let c_start = aligned_c_start(a_residue as i64, b_residue as i64, 6);
+                let masks = compute_period_masks_mod35(
+                    a_residue as i64,
+                    b_residue as i64,
+                    c_start,
+                    &buckets.valid_mod5,
+                    &buckets.valid_mod7,
+                );
+                let base = (a_residue * MOD35_B_RESIDUE_COUNT + b_residue / 3) * 35;
+                for (index, &mask) in masks.iter().enumerate() {
+                    mod35[base + index] = intern_mask(mask, &mut mask_ids, &mut mask_values);
+                }
+            }
+
+            for (b_residue, &b_index) in non_mod3_b_index.iter().enumerate() {
+                if b_residue % 3 == 0 {
+                    continue;
+                }
+                let c_start = aligned_c_start(a_residue as i64, b_residue as i64, 2);
+                let masks = compute_period_masks_mod105(
+                    a_residue as i64,
+                    b_residue as i64,
+                    c_start,
+                    &buckets.valid_mod3,
+                    &buckets.valid_mod5,
+                    &buckets.valid_mod7,
+                );
+                let base = (a_residue * MOD105_B_RESIDUE_COUNT + b_index) * 105;
+                for (index, &mask) in masks.iter().enumerate() {
+                    mod105[base + index] = intern_mask(mask, &mut mask_ids, &mut mask_values);
+                }
+            }
+        }
+
+        debug_assert_eq!(next_non_mod3_index, MOD105_B_RESIDUE_COUNT);
+        Self {
+            mod35,
+            mod105,
+            mask_values: mask_values.into_boxed_slice(),
+            non_mod3_b_index,
+        }
+    }
+
+    #[inline(always)]
+    pub fn mod35(&self, a: i64, b: i64) -> &[u16; 35] {
+        let a_residue = a.rem_euclid(MASK_RESIDUE_PERIOD as i64) as usize;
+        let b_residue = b.rem_euclid(MASK_RESIDUE_PERIOD as i64) as usize;
+        self.mod35_residue(a_residue, b_residue)
+    }
+
+    #[inline(always)]
+    pub fn mod35_residue(&self, a_residue: usize, b_residue: usize) -> &[u16; 35] {
+        let base = (a_residue * MOD35_B_RESIDUE_COUNT + b_residue / 3) * 35;
+        self.mod35[base..base + 35].try_into().unwrap()
+    }
+
+    #[inline(always)]
+    pub fn mod105(&self, a: i64, b: i64) -> &[u16; 105] {
+        let a_residue = a.rem_euclid(MASK_RESIDUE_PERIOD as i64) as usize;
+        let b_residue = b.rem_euclid(MASK_RESIDUE_PERIOD as i64) as usize;
+        self.mod105_residue(a_residue, b_residue)
+    }
+
+    #[inline(always)]
+    pub fn mod105_residue(&self, a_residue: usize, b_residue: usize) -> &[u16; 105] {
+        let base =
+            (a_residue * MOD105_B_RESIDUE_COUNT + self.non_mod3_b_index[b_residue]) * 105;
+        self.mod105[base..base + 105].try_into().unwrap()
+    }
+
+    #[inline(always)]
+    pub fn value(&self, id: u16) -> u128 {
+        unsafe { *self.mask_values.get_unchecked(id as usize) }
+    }
+}
+
+fn intern_mask(mask: u128, ids: &mut HashMap<u128, u16>, values: &mut Vec<u128>) -> u16 {
+    if let Some(&id) = ids.get(&mask) {
+        return id;
+    }
+    let id = u16::try_from(values.len()).expect("periodic mask pool exceeds u16 capacity");
+    values.push(mask);
+    ids.insert(mask, id);
+    id
 }
 
 // ============================================================================
@@ -569,6 +685,16 @@ pub fn compute_period_masks_mod35(
         }
     }
     masks
+}
+
+#[inline]
+fn aligned_c_start(a: i64, b: i64, step: i64) -> i64 {
+    let rem = (a + b + C_MIN).rem_euclid(step);
+    if rem == 0 {
+        C_MIN
+    } else {
+        C_MIN + (step - rem)
+    }
 }
 
 /// Precomputes periodic residue masks for b % 3 != 0 (period = 105 steps of c += 2).
@@ -1098,10 +1224,10 @@ pub fn parse_checkpoint(content: &str) -> Option<CheckpointData> {
         }
     }
 
-    if let Some(version) = schema_version {
-        if version == 0 {
-            return None;
-        }
+    if let Some(version) = schema_version
+        && version == 0
+    {
+        return None;
     }
 
     last_a.map(|a| CheckpointData {
@@ -1304,10 +1430,25 @@ fn main() {
             / 1024.0
     );
 
+    print!("Precomputing periodic CRT mask cache... ");
+    let mask_cache_start = Instant::now();
+    let mask_cache = PeriodicMaskCache::new(&buckets);
+    println!(
+        "DONE in {:.2?} (~{:.1} MiB)",
+        mask_cache_start.elapsed(),
+        (mask_cache.mod35.len() * std::mem::size_of::<u16>()
+            + mask_cache.mod105.len() * std::mem::size_of::<u16>()
+            + mask_cache.mask_values.len() * std::mem::size_of::<u128>()) as f64
+            / (1024.0 * 1024.0)
+    );
+
     // 4. Construct strictly non-zero cubic coefficients: a in [-A_MAX..=-A_MIN] U [A_MIN..=A_MAX]
     let a_values: Vec<i64> = (-A_MAX..=-A_MIN).chain(A_MIN..=A_MAX).collect();
     let num_a = a_values.len();
     let num_b = (B_MAX - B_MIN + 1) as usize;
+    let b_residues: Vec<usize> = (B_MIN..=B_MAX)
+        .map(|b| b.rem_euclid(MASK_RESIDUE_PERIOD as i64) as usize)
+        .collect();
 
     // Checkpoint management with configuration hash verification
     let start_a_idx = match load_checkpoint() {
@@ -1451,6 +1592,7 @@ fn main() {
 
     // Iterate through remaining `a` chunks in order, parallelizing `b` with Rayon
     for &a in &a_values[start_a_idx..] {
+        let a_residue = a.rem_euclid(MASK_RESIDUE_PERIOD as i64) as usize;
         let ctx = SearchContext {
             l1: &l1_byte_table,
             sieve: &sieve,
@@ -1460,8 +1602,10 @@ fn main() {
         let buckets_ref = &buckets;
         let theoretical_per_b: u64 = total_c * total_d;
 
-        (B_MIN..=B_MAX).into_par_iter().for_each(|b| {
+        (0..num_b).into_par_iter().for_each(|b_idx| {
+            let b = B_MIN + b_idx as i64;
             let mut local_tested: u64 = 0;
+            let b_residue = b_residues[b_idx];
 
             let ab = a + b;
             let p2_base = 8 * a + 4 * b;
@@ -1477,13 +1621,7 @@ fn main() {
                 let rem = (ab + C_MIN).rem_euclid(6);
                 let c_start = if rem == 0 { C_MIN } else { C_MIN + (6 - rem) };
 
-                let period_masks = compute_period_masks_mod35(
-                    a,
-                    b,
-                    c_start,
-                    &buckets_ref.valid_mod5,
-                    &buckets_ref.valid_mod7,
-                );
+                let period_masks = mask_cache.mod35_residue(a_residue, b_residue);
                 let mut step_idx = 0usize;
 
                 let mut c = c_start;
@@ -1495,7 +1633,8 @@ fn main() {
                 let mut p3_idx = ((p3 - 3) >> 1) as isize + 1;
 
                 while c <= C_MAX {
-                    let mut mask = unsafe { *period_masks.get_unchecked(step_idx) };
+                    let mask_id = unsafe { *period_masks.get_unchecked(step_idx) };
+                    let mut mask = mask_cache.value(mask_id);
                     step_idx = if step_idx + 1 == 35 { 0 } else { step_idx + 1 };
 
                     if mask != 0 {
@@ -1546,14 +1685,7 @@ fn main() {
                     if C_MIN % 2 != 0 { C_MIN } else { C_MIN + 1 }
                 };
 
-                let period_masks = compute_period_masks_mod105(
-                    a,
-                    b,
-                    c_start,
-                    &buckets_ref.valid_mod3,
-                    &buckets_ref.valid_mod5,
-                    &buckets_ref.valid_mod7,
-                );
+                let period_masks = mask_cache.mod105_residue(a_residue, b_residue);
                 let mut step_idx = 0usize;
 
                 let mut c = c_start;
@@ -1565,7 +1697,8 @@ fn main() {
                 let mut p3_idx = ((p3 - 3) >> 1) as isize + 1;
 
                 while c <= C_MAX {
-                    let mut mask = unsafe { *period_masks.get_unchecked(step_idx) };
+                    let mask_id = unsafe { *period_masks.get_unchecked(step_idx) };
+                    let mut mask = mask_cache.value(mask_id);
                     step_idx = if step_idx + 1 == 105 { 0 } else { step_idx + 1 };
 
                     if mask != 0 {
@@ -2007,6 +2140,61 @@ mod tests {
                     "Mismatch for r={} on poly a={}, b={}, c={}",
                     r, a, b, c
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_periodic_mask_cache_matches_dynamic_generation() {
+        let sieve = Sieve::new(SIEVE_LIMIT);
+        let buckets = Mod105Buckets::new(&sieve);
+        let cache = PeriodicMaskCache::new(&buckets);
+
+        for a in 0..MASK_RESIDUE_PERIOD as i64 {
+            for b in (0..MASK_RESIDUE_PERIOD as i64).step_by(3) {
+                let c_start = aligned_c_start(a, b, 6);
+                let expected = compute_period_masks_mod35(
+                    a,
+                    b,
+                    c_start,
+                    &buckets.valid_mod5,
+                    &buckets.valid_mod7,
+                );
+                for (index, &expected_mask) in expected.iter().enumerate() {
+                    assert_eq!(
+                        cache.value(cache.mod35(a, b)[index]),
+                        expected_mask,
+                        "mod35 cache mismatch for a={}, b={}, step={}",
+                        a,
+                        b,
+                        index
+                    );
+                }
+            }
+
+            for b in 0..MASK_RESIDUE_PERIOD as i64 {
+                if b % 3 == 0 {
+                    continue;
+                }
+                let c_start = aligned_c_start(a, b, 2);
+                let expected = compute_period_masks_mod105(
+                    a,
+                    b,
+                    c_start,
+                    &buckets.valid_mod3,
+                    &buckets.valid_mod5,
+                    &buckets.valid_mod7,
+                );
+                for (index, &expected_mask) in expected.iter().enumerate() {
+                    assert_eq!(
+                        cache.value(cache.mod105(a, b)[index]),
+                        expected_mask,
+                        "mod105 cache mismatch for a={}, b={}, step={}",
+                        a,
+                        b,
+                        index
+                    );
+                }
             }
         }
     }
