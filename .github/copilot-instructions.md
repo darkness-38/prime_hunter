@@ -1,5 +1,17 @@
 # Copilot instructions for `prime_hunter`
 
+## Project overview
+
+`prime_hunter` is a Rust 2024 command-line engine that searches strictly cubic integer polynomials
+
+```text
+f(n) = a*n^3 + b*n^2 + c*n + d
+```
+
+for long consecutive prime runs starting at `n = 0`. The search is performance-sensitive and
+uses Rayon to parallelize the `b` dimension while keeping the outer `a` dimension ordered for
+checkpointing.
+
 ## Build, test, and lint
 
 Run commands from the repository root:
@@ -7,72 +19,72 @@ Run commands from the repository root:
 ```bash
 cargo check
 cargo test
-cargo test test_miller_rabin_carmichael_numbers
+cargo test test_finite_differences_matches_direct_eval
+cargo test checkpoint
 cargo clippy
 cargo build --release
 ./target/release/prime_hunter
 ```
 
-The test suite is an inline `#[cfg(test)]` module at the end of `src/main.rs`.
-`cargo test <filter>` runs one test or a matching group; use
-`cargo test <filter> -- --nocapture` when test output is needed.
+`cargo test <filter>` runs one test or a matching group; add `-- --nocapture` when debugging
+test output. The test suite is in the `#[cfg(test)]` module at the end of `src/main.rs`.
 
-Use the release binary for meaningful performance measurements. The release profile
-uses `opt-level = 3`, fat LTO, one codegen unit, and `panic = "abort"`.
-`.cargo/config.toml` enables `-C target-cpu=native`; preserve both settings when
-changing or benchmarking the hot path.
+The release profile uses fat LTO, one codegen unit, `panic = "abort"`, and
+`.cargo/config.toml` enables `-C target-cpu=native`. Preserve these settings when evaluating
+performance or making benchmark-related changes.
 
 ## Architecture
 
-- `src/main.rs` contains the complete executable, search implementation, logging,
-  and tests. There is no separate library or integration-test target.
-- `main` builds all prime `d` candidates in the configured interval with a sieve,
-  then searches the coefficient space using nested Rayon iterators. `a` excludes
-  zero, `b` is represented as `b_mult * 3`, and `c` is scanned over its bounded
-  interval.
-- The `c` loop applies two mathematical shields before examining `d`: parity
-  alignment makes `f(1)` odd for odd `d`, and the mod-3 condition rejects
-  combinations for which either `f(1)` or `f(2)` is forced divisible by 3.
-- `fails_early` evaluates `f(1)` through `f(5)` with Horner-style arithmetic and
-  rejects non-positive, even, or small-prime-divisible values before the full
-  streak check. `count_prime_streak` validates `d = f(0)` and then evaluates
-  consecutive values with deterministic Miller–Rabin.
-- `is_prime_miller_rabin` is the exact primality backend for the `u64` domain:
-  it handles small cases and trial-divides by small primes before using
-  deterministic witness sets appropriate to the input range. Keep the
-  `u128` modular multiplication because it prevents overflow.
-- Successful runs update the global `BEST_LEN` atomic and serialize console/file
-  discovery output with `LOG_MUTEX`. `discoveries.txt` is an append-only runtime
-  log and should not be treated as source configuration.
-- A dedicated background telemetry thread logs progress, total evaluated
-  combinations, throughput, and current best streak every 2 seconds without
-  interfering with worker threads, serialized via `LOG_MUTEX`. Global
-  candidates are batched locally to avoid cache contention.
+- `src/main.rs` contains the complete implementation: configuration bounds, mathematical
+  pruning, prime tables, the parallel search loop, telemetry, checkpointing, discovery logging,
+  and unit tests.
+- Startup builds a `primal::Sieve` up to `SIEVE_LIMIT`, then creates the fixed-size L1 byte table
+  for odd values below `L1_LIMIT`. Primality checks use the L1 table first, the global sieve
+  second, and `primal::is_prime` for larger values.
+- The search enumerates non-zero `a` values in `[-A_MAX..-A_MIN]` followed by
+  `[A_MIN..A_MAX]`; Rayon parallelizes `b`. The `c` loop advances by two after parity alignment,
+  and `d` candidates are stored in contiguous `Mod105Buckets` slices keyed by `d % 105`.
+- Before testing a candidate, the engine rejects residue buckets whose values at `n = 1, 2, 3`
+  are divisible by 3, 5, or 7. Candidates that survive direct checks at `n = 1, 2, 3` are
+  verified from `n >= 4` with third-order finite differences, avoiding multiplications in the
+  hot loop.
+- Global atomics track theoretical combinations, tested candidates, outer-loop progress (`COMPLETED_A` / `TOTAL_A`),
+  and current best streak length. A dedicated background telemetry thread (`std::thread::spawn`) logs progress %,
+  elapsed time, total combinations, real-time throughput (M/s), and current best streak every 2 seconds.
+- Candidate and combination evaluations are batched thread-locally (`CandidateAccumulator`, `BATCH_SIZE = 100_000`)
+  to avoid false sharing and memory bus contention across Rayon worker threads.
+- Console and file discovery output and telemetry status lines are serialized via `PRINT_LOCK` and `LOG_MUTEX`
+  to guarantee zero clobbering of record-breaking discoveries (`Len >= 40`).
+- After each complete `a` slice, the engine atomically writes `checkpoint.txt`. It validates a
+  configuration hash on resume and still accepts legacy checkpoints containing only an integer.
+  Discoveries at or above `LOCAL_RECORD_THRESHOLD` are appended to `discoveries.txt`.
 
 ## Search invariants and conventions
 
-- The searched polynomial is `f(n) = a*n^3 + b*n^2 + c*n + d`, with `a != 0`.
-  Current runtime bounds and thresholds are printed in `main`; update comments,
-  tests, and README claims together when changing them.
-- Keep `d` prime: `generate_d_primes` must return an ordered, inclusive-range
-  candidate list, and `count_prime_streak` must continue to return zero when
-  `d` is not prime.
-- The parity and mod-3 shields are correctness-preserving pruning rules, not
-  merely performance options. Any change to them needs algebraic soundness
-  coverage in the inline tests.
-- Keep the early-pruning checks consistent with the actual prime backend. A
-  candidate equal to the divisor itself is allowed for the small-prime checks;
-  other non-positive or divisible values must terminate the candidate.
-- `format_polynomial` is the canonical human-readable representation used in
-  discovery messages and has edge-case tests for zero and unit coefficients.
-- Discovery output is concurrent: update atomics before logging and hold
-  `LOG_MUTEX` while writing the complete message and appending to
-  `discoveries.txt`. Report file open/write failures rather than silently
-  treating them as successful logging.
-- Avoid allocations, locks, repeated general-purpose work, or changes to the
-  pruning order inside the nested `a`/`b_mult`/`c`/`d` search unless the
-  performance impact is measured with a release build.
-- The extended mathematical derivations and optimization discussion in
-  `gemini.md` and the user-facing search description in `README.md` are useful
-  context, but verify implementation claims against `src/main.rs` before
-  relying on them.
+- Keep `a != 0`; this is a strictly cubic search. Current bounds are declared at the top of
+  `src/main.rs`: `a` ±1..300, `b` -2500..2500, `c` -8000..8000, and prime `d` 29..10000.
+- `D_MIN = 29` is intentional for the record target (`L >= 28`), based on the divisibility
+  argument for `f(k*d)`. Do not restore `d = 2`, `d = 3`, or other small primes without updating
+  the proof comments, culling logic, configuration hash, and tests.
+- The `c` parity alignment is coupled to odd `d`: it ensures `f(1)` can be odd. The Mod-105
+  filter is coupled to the `P1`, `P2`, and `P3` values maintained as `c` advances; changes to
+  coefficient iteration must preserve these incremental updates.
+- `Mod105Buckets` uses parallel `raw_d` and pre-shifted `d_half` slices plus `offsets`; keep
+  their indexing and residue ordering synchronized. Its 48 non-empty coprime residue buckets
+  are covered by integrity tests.
+- `is_prime_l1_odd` is only for values known to be odd. It handles negative/small values and
+  falls back safely when a value is outside the L1 table or sieve range. Preserve those guards
+  when changing candidate evaluation.
+- Candidate evaluation starts with direct values at `n = 1, 2, 3`; the finite-difference state
+  must remain equivalent to Horner evaluation. Update the corresponding finite-difference tests
+  when changing the recurrence or its initialization.
+- Mathematical pruning is part of correctness, not merely an optimization. Soundness tests
+  cover parity, the `d = 2`/`d = 3` bounds, `D_MIN`, and Mod-105 filtering; known discoveries
+  must continue to pass the filter.
+- Checkpoint writes must remain atomic and durable (`sync_all` before rename), and checkpoint
+  parsing must retain both structured metadata and legacy raw-integer compatibility. Corrupted
+  checkpoints are reported rather than silently overwritten.
+- Performance changes should be assessed against the release build. Avoid allocations,
+  locking, or general-purpose polynomial evaluation inside the `b`/`c`/`d` hot path.
+
+For the detailed mathematical derivations and optimization rationale, consult `gemini.md`.
