@@ -10,7 +10,7 @@ Welcome to `prime_hunter`. This document provides a complete technical, mathemat
 
 $$f(n) = a n^3 + b n^2 + c n + d \quad (a, b, c, d \in \mathbb{Z}, \; a \neq 0)$$
 
-that generate long consecutive streaks of prime numbers for consecutive non-negative integers $n = 0, 1, 2, \dots, L - 1$. The goal is to maximize the run length $L$, hunting for local records ($L \ge 36$) and potential world records ($L \ge 45$).
+that generate long consecutive streaks of prime numbers for consecutive non-negative integers $n = 0, 1, 2, \dots, L - 1$. The goal is to maximize the run length $L$, hunting for local records ($L \ge 36$) and potential world records ($L \ge 46$).
 
 ### Mathematical Rigor & Optimizations
 
@@ -228,7 +228,7 @@ On Intel Gracemont E-cores (e.g. Core i3-N305, N100), bitwise extraction operati
 
 #### 11. Bidirectional Streak Extension ($n < 0$) & Canonical Polynomial Translation
 - **Backward Exploration (V2 — threshold lowered to 10)**:
-  When forward streak verification reaches $L_{\text{fwd}} \ge 10$ (lowered from 28 in V2 to catch asymmetric straddling records), `verify_deep_streak` evaluates $f(n)$ backwards at $n = -1, -2, -3, \dots$ until hitting a non-prime or composite value.
+  When forward streak verification reaches $L_{\text{fwd}} \ge 22$, `verify_deep_streak` evaluates $f(n)$ backwards at $n = -1, -2, -3, \dots$ until hitting a non-prime or composite value.
   If $k \ge 0$ consecutive primes exist backwards, the total uninterrupted prime streak is:
   $$L_{\text{total}} = L_{\text{fwd}} + k$$
 - **Canonical Polynomial Translation**:
@@ -387,9 +387,9 @@ Located in [`src/main.rs`](file:///home/teto/Documents/GitHub/math/prime_hunter/
 | `B_MIN`, `B_MAX` | `-1000`, `1000` | $b \in [-1000..1000]$ ($2,001$ values) |
 | `C_MIN`, `C_MAX` | `-3000`, `3000` | $c \in [-3000..3000]$ ($6,001$ values, $3,000$ or $3,001$ tested per $(a, b)$) |
 | `D_MIN`, `D_MAX` | `29`, `10000` | $d$ odd primes in $[29, 10000]$ ($1,220$ primes, $d \le 23$ culled) |
-| `BACKWARD_SEARCH_THRESHOLD` | `10` | Minimum forward streak length to trigger backward extension check ($n < 0$). Lowered to 10 (V2) to catch asymmetric straddling records where the forward reach is short. |
+| `BACKWARD_SEARCH_THRESHOLD` | `22` | Minimum forward streak length to trigger backward extension check ($n < 0$). Set to catch near-symmetric length-46 candidates. |
 | `LOCAL_RECORD_THRESHOLD` | `36` | Minimum streak length to trigger console discovery and append to `discoveries.txt` |
-| `WORLD_RECORD_THRESHOLD` | `45` | Minimum streak length to trigger world record banner |
+| `WORLD_RECORD_THRESHOLD` | `46` | Minimum streak length to trigger world record banner |
 | `SIEVE_LIMIT` | `100_000_000` | Upper limit of Tier 2 prime sieve |
 | `L1_LIMIT` | `32_768` | Upper limit of Tier 1 L1-resident byte table |
 | `L1_SIZE` | `16_384` | Size of Tier 1 L1 byte table ($16\text{ KiB}$) |

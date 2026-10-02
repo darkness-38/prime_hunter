@@ -29,9 +29,9 @@ pub const C_MAX: i64 = 3000;
 pub const D_MIN: usize = 29;
 pub const D_MAX: usize = 10000;
 
-pub const BACKWARD_SEARCH_THRESHOLD: usize = 10;
+pub const BACKWARD_SEARCH_THRESHOLD: usize = 22;
 pub const LOCAL_RECORD_THRESHOLD: usize = 36;
-pub const WORLD_RECORD_THRESHOLD: usize = 45;
+pub const WORLD_RECORD_THRESHOLD: usize = 46;
 
 pub const BATCH_SIZE: u64 = 10_000_000;
 pub const HEARTBEAT_INTERVAL: u64 = 10_000_000_000;
@@ -560,7 +560,7 @@ pub fn shift_polynomial_backward(a: i64, b: i64, c: i64, d: i64, k: usize) -> (i
 /// Verification for streaks of length >= 4 via 3rd-order finite differences.
 /// Outlined and marked #[cold] / #[inline(never)] to completely relieve register
 /// pressure on the 16 x86-64 GPRs inside the hot evaluate_d_slice loop.
-/// When forward streak reaches BACKWARD_SEARCH_THRESHOLD (L >= 28), evaluates backwards (n < 0)
+/// When forward streak reaches BACKWARD_SEARCH_THRESHOLD (L >= 22), evaluates backwards (n < 0)
 /// and shifts the polynomial so the complete bidirectional streak starts at n = 0.
 /// If total streak length reaches LOCAL_RECORD_THRESHOLD (L >= 36), reports discovery.
 #[inline(never)]
