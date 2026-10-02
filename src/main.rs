@@ -2,7 +2,6 @@ use primal::Sieve;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Write, stdout};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -44,6 +43,7 @@ pub const SIEVE_LIMIT: usize = 100_000_000;
 // Fits 100% in the 32 KiB L1d cache of each core alongside candidate lists.
 pub const L1_LIMIT: usize = 32_768;
 pub const L1_SIZE: usize = L1_LIMIT / 2; // 16,384 bytes
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 // Static compile-time assertions proving bounds cannot overflow i64 up to n = 1000
 const fn static_check_no_overflow() -> bool {
     const N: i64 = 1000;
@@ -998,28 +998,57 @@ impl std::fmt::Display for CheckpointError {
     }
 }
 
-/// Computes a 64-bit deterministic hash of all search configuration bounds
+/// Computes a stable FNV-1a hash of the versioned search configuration schema.
 pub fn compute_config_hash() -> u64 {
-    let mut hasher = DefaultHasher::new();
-    A_MIN.hash(&mut hasher);
-    A_MAX.hash(&mut hasher);
-    B_MIN.hash(&mut hasher);
-    B_MAX.hash(&mut hasher);
-    C_MIN.hash(&mut hasher);
-    C_MAX.hash(&mut hasher);
-    (D_MIN as u64).hash(&mut hasher);
-    (D_MAX as u64).hash(&mut hasher);
-    hasher.finish()
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+
+    let mut update = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    };
+
+    update(b"prime_hunter/checkpoint-config");
+    update(&CHECKPOINT_SCHEMA_VERSION.to_le_bytes());
+    for value in [
+        A_MIN,
+        A_MAX,
+        B_MIN,
+        B_MAX,
+        C_MIN,
+        C_MAX,
+        D_MIN as i64,
+        D_MAX as i64,
+    ] {
+        update(&value.to_le_bytes());
+    }
+    hash
 }
 
-/// Formats checkpoint content with configuration bounds metadata and hash
+/// Formats checkpoint content with versioned configuration metadata and hash.
 pub fn format_checkpoint(last_a: i64, config_hash: u64) -> String {
     format!(
         "# Prime Hunter Checkpoint File\n\
          # Configuration Bounds: a=[-{}..-{}] U [{}..{}], b=[{}..{}], c=[{}..{}], d=[{}..{}]\n\
+         SCHEMA_VERSION: {}\n\
          CONFIG_HASH: {:#018x}\n\
          LAST_A: {}\n",
-        A_MAX, A_MIN, A_MIN, A_MAX, B_MIN, B_MAX, C_MIN, C_MAX, D_MIN, D_MAX, config_hash, last_a
+        A_MAX,
+        A_MIN,
+        A_MIN,
+        A_MAX,
+        B_MIN,
+        B_MAX,
+        C_MIN,
+        C_MAX,
+        D_MIN,
+        D_MAX,
+        CHECKPOINT_SCHEMA_VERSION,
+        config_hash,
+        last_a
     )
 }
 
@@ -1028,13 +1057,16 @@ pub fn parse_checkpoint(content: &str) -> Option<CheckpointData> {
     let mut config_hash = None;
     let mut last_a = None;
     let mut has_hash_field = false;
+    let mut schema_version = None;
 
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix("CONFIG_HASH:") {
+        if let Some(rest) = trimmed.strip_prefix("SCHEMA_VERSION:") {
+            schema_version = Some(rest.trim().parse::<u32>().ok()?);
+        } else if let Some(rest) = trimmed.strip_prefix("CONFIG_HASH:") {
             has_hash_field = true;
             let hash_str = rest.trim();
             let parsed = if let Some(hex) = hash_str
@@ -1062,6 +1094,12 @@ pub fn parse_checkpoint(content: &str) -> Option<CheckpointData> {
             }
         } else {
             // Unrecognized non-comment content
+            return None;
+        }
+    }
+
+    if let Some(version) = schema_version {
+        if version == 0 {
             return None;
         }
     }
@@ -2388,6 +2426,8 @@ mod tests {
 
     #[test]
     fn test_parse_checkpoint() {
+        assert_eq!(compute_config_hash(), 0x84a1bcd5c8222eae);
+
         // Empty / comment only
         assert_eq!(parse_checkpoint(""), None);
         assert_eq!(parse_checkpoint("# Comment line\n\n"), None);
@@ -2410,6 +2450,7 @@ mod tests {
 
         // New structured format with metadata hash
         let structured = "# Prime Hunter Checkpoint\n\
+                          SCHEMA_VERSION: 2\n\
                           CONFIG_HASH: 0x123456789abcdef0\n\
                           LAST_A: 42\n";
         assert_eq!(
@@ -2422,15 +2463,39 @@ mod tests {
 
         // Corrupted hash
         let corrupted_hash = "# Prime Hunter Checkpoint\n\
+                              SCHEMA_VERSION: 2\n\
                               CONFIG_HASH: 0xZZZZ\n\
                               LAST_A: 42\n";
         assert_eq!(parse_checkpoint(corrupted_hash), None);
 
         // Corrupted LAST_A
         let corrupted_last_a = "# Prime Hunter Checkpoint\n\
+                                SCHEMA_VERSION: 2\n\
                                 CONFIG_HASH: 0x123456789abcdef0\n\
                                 LAST_A: not_a_number\n";
         assert_eq!(parse_checkpoint(corrupted_last_a), None);
+
+        // Pre-versioned structured checkpoints remain readable.
+        let pre_versioned = "# Prime Hunter Checkpoint\n\
+                             CONFIG_HASH: 0x123456789abcdef0\n\
+                             LAST_A: 42\n";
+        assert_eq!(
+            parse_checkpoint(pre_versioned),
+            Some(CheckpointData {
+                last_a: 42,
+                config_hash: Some(0x123456789abcdef0),
+            })
+        );
+
+        // Invalid schema versions are rejected.
+        assert_eq!(
+            parse_checkpoint("SCHEMA_VERSION: invalid\nCONFIG_HASH: 0x1\nLAST_A: 42\n"),
+            None
+        );
+        assert_eq!(
+            parse_checkpoint("SCHEMA_VERSION: 0\nCONFIG_HASH: 0x1\nLAST_A: 42\n"),
+            None
+        );
 
         // Invalid format
         assert_eq!(parse_checkpoint("invalid"), None);
@@ -2453,6 +2518,8 @@ mod tests {
         let data = loaded.unwrap().expect("Checkpoint data should be present");
         assert_eq!(data.last_a, test_a);
         assert_eq!(data.config_hash, Some(compute_config_hash()));
+        let content = fs::read_to_string(final_str).unwrap();
+        assert!(content.contains("SCHEMA_VERSION: 2"));
 
         // Clean up
         let _ = fs::remove_file(final_path);
