@@ -1,4 +1,0 @@
-# Prime Hunter Checkpoint File
-# Configuration Bounds: a=[-150..-1] U [1..150], b=[-1000..1000], c=[-3000..3000], d=[29..10000]
-CONFIG_HASH: 0xa53e0d24ee04e1f4
-LAST_A: 103
