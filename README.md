@@ -177,9 +177,9 @@ cargo clippy
 The active search bounds are declared near the top of `src/main.rs`:
 
 ```text
-a: [-150..-1] U [1..150]
-b: [-1000..1000]
-c: [-3000..3000]
+a: [-300..-1] U [1..300]
+b: [-2500..2500]
+c: [-8000..8000]
 d: prime values [29..10000]
 ```
 

@@ -57,7 +57,7 @@ performance or making benchmark-related changes.
 ## Search invariants and conventions
 
 - Keep `a != 0`; this is a strictly cubic search. Current bounds are declared at the top of
-  `src/main.rs`: `a` ±1..150, `b` -1000..1000, `c` -3000..3000, and prime `d` 29..10000.
+  `src/main.rs`: `a` ±1..300, `b` -2500..2500, `c` -8000..8000, and prime `d` 29..10000.
 - `D_MIN = 29` is intentional for the record target (`L >= 28`), based on the divisibility
   argument for `f(k*d)`. Do not restore `d = 2`, `d = 3`, or other small primes without updating
   the proof comments, culling logic, configuration hash, and tests.

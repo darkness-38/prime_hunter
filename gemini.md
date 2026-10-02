@@ -351,11 +351,11 @@ The hot evaluation loop performs **3 integer additions** and **zero multiplicati
 - Checkpoints store configuration metadata:
   ```text
   # Prime Hunter Checkpoint File
-  # Configuration Bounds: a=[-150..-1] U [1..150], b=[-1000..1000], c=[-3000..3000], d=[29..10000]
-  CONFIG_HASH: 0xa53e0d24ee04e1f4
+  # Configuration Bounds: a=[-300..-1] U [1..300], b=[-2500..2500], c=[-8000..8000], d=[29..10000]
+  CONFIG_HASH: 0x6dd272e10132d723
   LAST_A: 34
   ```
-- **Configuration Hashing**: A 64-bit deterministic hash of all search bounds ([`compute_config_hash`](file:///home/teto/Documents/GitHub/math/prime_hunter/src/main.rs#L582-L593)) is stored and validated on resume to detect mismatched constants. For the current active search space (`D_MIN = 29`), the configuration hash is `0xa53e0d24ee04e1f4`.
+- **Configuration Hashing**: A 64-bit deterministic hash of all search bounds ([`compute_config_hash`](file:///home/teto/Documents/GitHub/math/prime_hunter/src/main.rs#L1180-L1202)) is stored and validated on resume to detect mismatched constants. For the current active search space (`D_MIN = 29`), the configuration hash is `0x6dd272e10132d723`.
 - **Safe Atomic I/O**: Checkpoint write performs explicit `sync_all()` to flush buffers to disk before atomic file rename, with comprehensive error logging.
 - **Backward Compatibility**: Seamlessly loads legacy checkpoints containing raw integers.
 
@@ -383,9 +383,9 @@ Located in [`src/main.rs`](file:///home/teto/Documents/GitHub/math/prime_hunter/
 
 | Parameter | Value | Range / Explanation |
 | :--- | :--- | :--- |
-| `A_MIN`, `A_MAX` | `1`, `150` | $a \in [-150..-1] \cup [1..150]$ ($300$ values, strictly cubic $a \neq 0$) |
-| `B_MIN`, `B_MAX` | `-1000`, `1000` | $b \in [-1000..1000]$ ($2,001$ values) |
-| `C_MIN`, `C_MAX` | `-3000`, `3000` | $c \in [-3000..3000]$ ($6,001$ values, $3,000$ or $3,001$ tested per $(a, b)$) |
+| `A_MIN`, `A_MAX` | `1`, `300` | $a \in [-300..-1] \cup [1..300]$ ($600$ values, strictly cubic $a \neq 0$) |
+| `B_MIN`, `B_MAX` | `-2500`, `2500` | $b \in [-2500..2500]$ ($5,001$ values) |
+| `C_MIN`, `C_MAX` | `-8000`, `8000` | $c \in [-8000..8000]$ ($16,001$ values, $8,000$ or $8,001$ tested per $(a, b)$) |
 | `D_MIN`, `D_MAX` | `29`, `10000` | $d$ odd primes in $[29, 10000]$ ($1,220$ primes, $d \le 23$ culled) |
 | `BACKWARD_SEARCH_THRESHOLD` | `22` | Minimum forward streak length to trigger backward extension check ($n < 0$). Set to catch near-symmetric length-46 candidates. |
 | `LOCAL_RECORD_THRESHOLD` | `36` | Minimum streak length to trigger console discovery and append to `discoveries.txt` |
@@ -396,9 +396,9 @@ Located in [`src/main.rs`](file:///home/teto/Documents/GitHub/math/prime_hunter/
 
 ### Combinatorics & Search Accounting
 - **Raw Combinatorial Space**:
-  $$\text{Total} = 300 \times 2,001 \times 6,001 \times 1,220 = 4,394,928,366,000 \approx 4.39 \times 10^{12} \text{ polynomials (4.39 Trillion)}$$
+  $$\text{Total} = 600 \times 5,001 \times 16,001 \times 1,220 = 58,575,372,732,000 \approx 58.58 \times 10^{12} \text{ polynomials (58.58 Trillion)}$$
 - **A Priori Pruned Space**: Parity pruning (50%) + Mod-105 residue pruning eliminates **>90%** of the entire space.
-- **Candidates Evaluated**: Only $< 10\%$ ($\approx 4.2 \times 10^{11}$ polynomials) are tested for primality.
+- **Candidates Evaluated**: Only $< 10\%$ ($\approx 5.9 \times 10^{12}$ polynomials) are tested for primality.
 
 ---
 
