@@ -383,8 +383,7 @@ impl PeriodicMaskCache {
 
     #[inline(always)]
     pub fn mod105_residue(&self, a_residue: usize, b_residue: usize) -> &[u16; 105] {
-        let base =
-            (a_residue * MOD105_B_RESIDUE_COUNT + self.non_mod3_b_index[b_residue]) * 105;
+        let base = (a_residue * MOD105_B_RESIDUE_COUNT + self.non_mod3_b_index[b_residue]) * 105;
         self.mod105[base..base + 105].try_into().unwrap()
     }
 
@@ -413,6 +412,43 @@ static LAST_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_BEST_LEN: AtomicUsize = AtomicUsize::new(0);
 static PRINT_LOCK: Mutex<()> = Mutex::new(());
 pub static ENGINE_START: OnceLock<Instant> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageCounts {
+    pub theoretical: u64,
+    pub parity_crt_points: u64,
+    pub mask_surviving_points: u64,
+    pub mask_candidates: u64,
+    pub reached_n1: u64,
+    pub reached_n2: u64,
+    pub reached_n3: u64,
+    pub deep_checks: u64,
+    pub backward_extensions: u64,
+}
+
+impl std::ops::AddAssign for StageCounts {
+    fn add_assign(&mut self, rhs: Self) {
+        self.theoretical += rhs.theoretical;
+        self.parity_crt_points += rhs.parity_crt_points;
+        self.mask_surviving_points += rhs.mask_surviving_points;
+        self.mask_candidates += rhs.mask_candidates;
+        self.reached_n1 += rhs.reached_n1;
+        self.reached_n2 += rhs.reached_n2;
+        self.reached_n3 += rhs.reached_n3;
+        self.deep_checks += rhs.deep_checks;
+        self.backward_extensions += rhs.backward_extensions;
+    }
+}
+
+impl std::ops::Add for StageCounts {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let mut total = self;
+        total += rhs;
+        total
+    }
+}
 
 /// In-memory canonical deduplication set.
 /// Stores (A, B, C, D) tuples of all shifted canonical polynomials already
@@ -487,6 +523,7 @@ pub struct SearchContext<'a> {
     pub sieve: &'a Sieve,
     pub sieve_bound: usize,
     pub engine_start: Instant,
+    pub report_discoveries: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -538,7 +575,8 @@ pub fn verify_deep_streak(
     l1: &[u8; L1_SIZE],
     sieve_ref: &Sieve,
     sieve_bound: usize,
-) {
+    report_discoveries: bool,
+) -> bool {
     // Sequential Step 4+: Deep verification loop via 3rd-order finite differences:
     // ZERO MULTIPLICATIONS in this loop!
     // Candidate values f(n) are guaranteed odd integers under parity pruning.
@@ -590,12 +628,10 @@ pub fn verify_deep_streak(
             }
         }
 
-        if total_len >= LOCAL_RECORD_THRESHOLD {
-            #[cfg(not(test))]
+        if total_len >= LOCAL_RECORD_THRESHOLD && report_discoveries {
             report_discovery(final_a, final_b, final_c, final_d, total_len);
-            #[cfg(test)]
-            let _ = (final_a, final_b, final_c, final_d, total_len);
         }
+        true
     } else if curr_len > 5 {
         // Update global best length live (accurate sequential reporting)
         let mut current_best = GLOBAL_BEST_LEN.load(Ordering::Relaxed);
@@ -610,6 +646,9 @@ pub fn verify_deep_streak(
                 Err(actual) => current_best = actual,
             }
         }
+        false
+    } else {
+        false
     }
 }
 
@@ -762,17 +801,72 @@ pub fn compute_period_masks_mod105(
 /// 2. 4-way coalesced unrolling via chunks_exact(4) and branchless OR to skip ~63% of quads in 1 branch.
 /// 3. Pre-folded L1 indexing for n = 1, 2, 3 avoiding subtractions, bit-shifts, and divisions.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn evaluate_candidate(
+    n1: bool,
+    d: u16,
+    d_half: u16,
+    poly: &PolyCoeffs,
+    ctx: &SearchContext,
+) -> StageCounts {
+    let mut counts = StageCounts::default();
+    if !n1 {
+        return counts;
+    }
+    counts.reached_n1 = 1;
+    if !check_l1_prefolded(
+        poly.p2_idx,
+        d_half,
+        poly.p2,
+        d,
+        ctx.l1,
+        ctx.sieve,
+        ctx.sieve_bound,
+    ) {
+        return counts;
+    }
+    counts.reached_n2 = 1;
+    if !check_l1_prefolded(
+        poly.p3_idx,
+        d_half,
+        poly.p3,
+        d,
+        ctx.l1,
+        ctx.sieve,
+        ctx.sieve_bound,
+    ) {
+        return counts;
+    }
+    counts.reached_n3 = 1;
+    counts.deep_checks = 1;
+    counts.backward_extensions = verify_deep_streak(
+        poly.a,
+        poly.b,
+        poly.c,
+        d as i64,
+        poly.p3 + d as i64,
+        ctx.l1,
+        ctx.sieve,
+        ctx.sieve_bound,
+        ctx.report_discoveries,
+    ) as u64;
+    counts
+}
+
+#[inline(always)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
-fn evaluate_d_slice(d_slice: &[u16], d_half_slice: &[u16], poly: &PolyCoeffs, ctx: &SearchContext) {
+fn evaluate_d_slice(
+    d_slice: &[u16],
+    d_half_slice: &[u16],
+    poly: &PolyCoeffs,
+    ctx: &SearchContext,
+) -> StageCounts {
+    let mut counts = StageCounts {
+        mask_candidates: d_slice.len() as u64,
+        ..StageCounts::default()
+    };
     let p1 = poly.p1;
-    let p2 = poly.p2;
-    let p3 = poly.p3;
     let p1_idx = poly.p1_idx;
-    let p2_idx = poly.p2_idx;
-    let p3_idx = poly.p3_idx;
-    let a = poly.a;
-    let b = poly.b;
-    let c = poly.c;
     let l1 = ctx.l1;
     let sieve_ref = ctx.sieve;
     let sieve_bound = ctx.sieve_bound;
@@ -840,63 +934,19 @@ fn evaluate_d_slice(d_slice: &[u16], d_half_slice: &[u16], poly: &PolyCoeffs, ct
 
         // Branchless OR coalescing: skips all 4 candidates in ~63% of quads in 1 branch
         if (b0 | b1 | b2 | b3) != 0 {
-            if b0 != 0
-                && check_l1_prefolded(p2_idx, h0, p2, d0, l1, sieve_ref, sieve_bound)
-                && check_l1_prefolded(p3_idx, h0, p3, d0, l1, sieve_ref, sieve_bound)
-            {
-                verify_deep_streak(a, b, c, d0 as i64, p3 + d0 as i64, l1, sieve_ref, sieve_bound);
-            }
-
-            if b1 != 0
-                && check_l1_prefolded(p2_idx, h1, p2, d1, l1, sieve_ref, sieve_bound)
-                && check_l1_prefolded(p3_idx, h1, p3, d1, l1, sieve_ref, sieve_bound)
-            {
-                verify_deep_streak(a, b, c, d1 as i64, p3 + d1 as i64, l1, sieve_ref, sieve_bound);
-            }
-
-            if b2 != 0
-                && check_l1_prefolded(p2_idx, h2, p2, d2, l1, sieve_ref, sieve_bound)
-                && check_l1_prefolded(p3_idx, h2, p3, d2, l1, sieve_ref, sieve_bound)
-            {
-                verify_deep_streak(a, b, c, d2 as i64, p3 + d2 as i64, l1, sieve_ref, sieve_bound);
-            }
-
-            if b3 != 0
-                && check_l1_prefolded(p2_idx, h3, p2, d3_cand, l1, sieve_ref, sieve_bound)
-                && check_l1_prefolded(p3_idx, h3, p3, d3_cand, l1, sieve_ref, sieve_bound)
-            {
-                verify_deep_streak(
-                    a,
-                    b,
-                    c,
-                    d3_cand as i64,
-                    p3 + d3_cand as i64,
-                    l1,
-                    sieve_ref,
-                    sieve_bound,
-                );
-            }
+            counts += evaluate_candidate(b0 != 0, d0, h0, poly, ctx);
+            counts += evaluate_candidate(b1 != 0, d1, h1, poly, ctx);
+            counts += evaluate_candidate(b2 != 0, d2, h2, poly, ctx);
+            counts += evaluate_candidate(b3 != 0, d3_cand, h3, poly, ctx);
         }
     }
 
     // Process remaining candidates if slice length is not a multiple of 4
     for (&d_val, &h_val) in d_rem.iter().zip(half_rem.iter()) {
-        if check_l1_prefolded(p1_idx, h_val, p1, d_val, l1, sieve_ref, sieve_bound)
-            && check_l1_prefolded(p2_idx, h_val, p2, d_val, l1, sieve_ref, sieve_bound)
-            && check_l1_prefolded(p3_idx, h_val, p3, d_val, l1, sieve_ref, sieve_bound)
-        {
-            verify_deep_streak(
-                a,
-                b,
-                c,
-                d_val as i64,
-                p3 + d_val as i64,
-                l1,
-                sieve_ref,
-                sieve_bound,
-            );
-        }
+        let n1 = check_l1_prefolded(p1_idx, h_val, p1, d_val, l1, sieve_ref, sieve_bound);
+        counts += evaluate_candidate(n1, d_val, h_val, poly, ctx);
     }
+    counts
 }
 
 /// Formats f(n) = a*n^3 + b*n^2 + c*n + d cleanly with mathematical signs
@@ -1370,11 +1420,155 @@ pub fn assert_search_bounds_no_overflow() {
     }
 }
 
+fn run_benchmark_tile() {
+    const BENCH_A_MIN: i64 = 10;
+    const BENCH_A_MAX: i64 = 15;
+    const BENCH_B_MIN: i64 = -100;
+    const BENCH_B_MAX: i64 = 100;
+    const BENCH_C_MIN: i64 = C_MIN;
+    const BENCH_C_MAX: i64 = C_MIN + 100;
+
+    assert_search_bounds_no_overflow();
+    let start = Instant::now();
+    let sieve = Arc::new(Sieve::new(SIEVE_LIMIT));
+    let sieve_bound = sieve.upper_bound();
+    let l1 = Arc::new(build_l1_byte_table(&sieve));
+    let buckets = Mod105Buckets::new(&sieve);
+    let mask_cache = PeriodicMaskCache::new(&buckets);
+    let b_values: Vec<i64> = (BENCH_B_MIN..=BENCH_B_MAX).collect();
+    let b_residues: Vec<usize> = b_values
+        .iter()
+        .map(|&b| b.rem_euclid(MASK_RESIDUE_PERIOD as i64) as usize)
+        .collect();
+    let total_d = buckets.raw_d.len() as u64;
+    let total_c = (BENCH_C_MAX - BENCH_C_MIN + 1) as u64;
+    let theoretical =
+        (BENCH_A_MAX - BENCH_A_MIN + 1) as u64 * b_values.len() as u64 * total_c * total_d;
+    let engine_start = start;
+    let _ = ENGINE_START.set(engine_start);
+    GLOBAL_BEST_LEN.store(0, Ordering::Relaxed);
+
+    let mut totals = StageCounts::default();
+    for a in BENCH_A_MIN..=BENCH_A_MAX {
+        let a_residue = a.rem_euclid(MASK_RESIDUE_PERIOD as i64) as usize;
+        let ctx = SearchContext {
+            l1: &l1,
+            sieve: &sieve,
+            sieve_bound,
+            engine_start,
+            report_discoveries: false,
+        };
+        let per_a = b_values
+            .par_iter()
+            .enumerate()
+            .map(|(b_idx, &b)| {
+                let mut counts = StageCounts {
+                    theoretical: total_c * total_d,
+                    ..StageCounts::default()
+                };
+                let b_residue = b_residues[b_idx];
+                let ab = a + b;
+                let p2_base = 8 * a + 4 * b;
+                let p3_base = 27 * a + 9 * b;
+                let d3 = 6 * a;
+                let step = if b % 3 == 0 { 6 } else { 2 };
+                let c_start = aligned_c_start(a, b, step);
+                let period = if step == 6 { 35 } else { 105 };
+                let mut c = c_start;
+                let mut p1 = ab + c_start;
+                let mut p2 = p2_base + 2 * c_start;
+                let mut p3 = p3_base + 3 * c_start;
+                let mut p1_idx = ((p1 - 3) >> 1) as isize + 1;
+                let mut p2_idx = ((p2 - 3) >> 1) as isize + 1;
+                let mut p3_idx = ((p3 - 3) >> 1) as isize + 1;
+                let mut step_idx = 0usize;
+                while c <= BENCH_C_MAX {
+                    counts.parity_crt_points += 1;
+                    let mask_id = if step == 6 {
+                        let masks = mask_cache.mod35_residue(a_residue, b_residue);
+                        masks[step_idx % period]
+                    } else {
+                        let masks = mask_cache.mod105_residue(a_residue, b_residue);
+                        masks[step_idx % period]
+                    };
+                    let mut mask = mask_cache.value(mask_id);
+                    step_idx += 1;
+                    if step_idx == period {
+                        step_idx = 0;
+                    }
+                    if mask != 0 {
+                        counts.mask_surviving_points += 1;
+                        let poly = PolyCoeffs {
+                            a,
+                            b,
+                            c,
+                            d3,
+                            p1,
+                            p2,
+                            p3,
+                            p1_idx,
+                            p2_idx,
+                            p3_idx,
+                        };
+                        while mask != 0 {
+                            let r = mask.trailing_zeros() as usize;
+                            mask &= mask - 1;
+                            let start = buckets.offsets[r] as usize;
+                            let end = buckets.offsets[r + 1] as usize;
+                            counts += evaluate_d_slice(
+                                &buckets.raw_d[start..end],
+                                &buckets.d_half[start..end],
+                                &poly,
+                                &ctx,
+                            );
+                        }
+                    }
+                    c += step;
+                    p1 += step;
+                    p2 += 2 * step;
+                    p3 += 3 * step;
+                    p1_idx += step as isize / 2;
+                    p2_idx += step as isize;
+                    p3_idx += 3 * step as isize / 2;
+                }
+                counts
+            })
+            .reduce(StageCounts::default, |left, right| left + right);
+        totals += per_a;
+    }
+
+    let elapsed = start.elapsed();
+    let seconds = elapsed.as_secs_f64();
+    println!("BENCHMARK TILE");
+    println!(
+        "tile: a=[{}..{}], b=[{}..{}], c=[{}..{}], d=prime[{}..{}]",
+        BENCH_A_MIN, BENCH_A_MAX, BENCH_B_MIN, BENCH_B_MAX, BENCH_C_MIN, BENCH_C_MAX, D_MIN, D_MAX
+    );
+    println!("wall time: {:.6}s", seconds);
+    println!(
+        "combinations/sec: {:.3} M",
+        theoretical as f64 / seconds / 1_000_000.0
+    );
+    println!("theoretical combinations: {}", totals.theoretical);
+    println!("pass parity/CRT c-points: {}", totals.parity_crt_points);
+    println!("pass mod-3/5/7/105 masks: {}", totals.mask_surviving_points);
+    println!("pass masks (candidate d): {}", totals.mask_candidates);
+    println!("reach n=1: {}", totals.reached_n1);
+    println!("reach n=2: {}", totals.reached_n2);
+    println!("reach n=3: {}", totals.reached_n3);
+    println!("deep primality checks: {}", totals.deep_checks);
+    println!("backward extensions: {}", totals.backward_extensions);
+}
+
 // ============================================================================
 // MAIN ENGINE ENTRY POINT
 // ============================================================================
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--bench") {
+        run_benchmark_tile();
+        return;
+    }
     println!("================================================================================");
     println!("  PRIME HUNTER: PURE DEGREE-3 (CUBIC) PRIME-GENERATING POLYNOMIAL ENGINE        ");
     println!("     FLAT MOD-105 BUCKETS | D_MIN=29 | 16 KB L1 BYTE TABLE | HARDENED CKPT      ");
@@ -1598,155 +1792,166 @@ fn main() {
             sieve: &sieve,
             sieve_bound,
             engine_start,
+            report_discoveries: true,
         };
         let buckets_ref = &buckets;
         let theoretical_per_b: u64 = total_c * total_d;
 
-        (0..num_b).into_par_iter().for_each(|b_idx| {
-            let b = B_MIN + b_idx as i64;
-            let mut local_tested: u64 = 0;
-            let b_residue = b_residues[b_idx];
-
-            let ab = a + b;
-            let p2_base = 8 * a + 4 * b;
-            let p3_base = 27 * a + 9 * b;
-            let d3 = 6 * a;
-
-            if b % 3 == 0 {
-                // Optimization 1: CRT Step-6 Pruning when b % 3 == 0
-                // When 3 | b, P2 = -P1 (mod 3). If P1 != 0 (mod 3), {P1, P2} mod 3 covers {1, 2},
-                // which eliminates 100% of candidate primes d >= 29 at n=1 or n=2.
-                // Thus surviving polynomials MUST satisfy a + b + c = 0 (mod 6).
-                // Furthermore, P1 = P2 = P3 = 0 (mod 3) identically, so mod-3 bitmask checks are bypassed!
-                let rem = (ab + C_MIN).rem_euclid(6);
-                let c_start = if rem == 0 { C_MIN } else { C_MIN + (6 - rem) };
-
-                let period_masks = mask_cache.mod35_residue(a_residue, b_residue);
-                let mut step_idx = 0usize;
-
-                let mut c = c_start;
-                let mut p1 = ab + c_start;
-                let mut p2 = p2_base + 2 * c_start;
-                let mut p3 = p3_base + 3 * c_start;
-                let mut p1_idx = ((p1 - 3) >> 1) as isize + 1;
-                let mut p2_idx = ((p2 - 3) >> 1) as isize + 1;
-                let mut p3_idx = ((p3 - 3) >> 1) as isize + 1;
-
-                while c <= C_MAX {
-                    let mask_id = unsafe { *period_masks.get_unchecked(step_idx) };
-                    let mut mask = mask_cache.value(mask_id);
-                    step_idx = if step_idx + 1 == 35 { 0 } else { step_idx + 1 };
-
-                    if mask != 0 {
-                        let poly = PolyCoeffs {
-                            a,
-                            b,
-                            c,
-                            d3,
-                            p1,
-                            p2,
-                            p3,
-                            p1_idx,
-                            p2_idx,
-                            p3_idx,
-                        };
-
-                        while mask != 0 {
-                            let r = mask.trailing_zeros() as usize;
-                            mask &= mask - 1;
-
-                            let start =
-                                unsafe { *buckets_ref.offsets.get_unchecked(r) } as usize;
-                            let end =
-                                unsafe { *buckets_ref.offsets.get_unchecked(r + 1) } as usize;
-
-                            let d_slice =
-                                unsafe { buckets_ref.raw_d.get_unchecked(start..end) };
-                            let d_half_slice =
-                                unsafe { buckets_ref.d_half.get_unchecked(start..end) };
-                            evaluate_d_slice(d_slice, d_half_slice, &poly, &ctx);
-                            local_tested += d_slice.len() as u64;
-                        }
-                    }
-
-                    c += 6;
-                    p1 += 6;
-                    p2 += 12;
-                    p3 += 18;
-                    p1_idx += 3;
-                    p2_idx += 6;
-                    p3_idx += 9;
-                }
-            } else {
-                // Parity Pruning when b % 3 != 0 (c steps by 2)
-                let c_start = if (ab & 1) == 0 {
-                    if C_MIN % 2 == 0 { C_MIN } else { C_MIN + 1 }
-                } else {
-                    if C_MIN % 2 != 0 { C_MIN } else { C_MIN + 1 }
+        let slice_counts = (0..num_b)
+            .into_par_iter()
+            .map(|b_idx| {
+                let b = B_MIN + b_idx as i64;
+                let mut counts = StageCounts {
+                    theoretical: theoretical_per_b,
+                    ..StageCounts::default()
                 };
+                let b_residue = b_residues[b_idx];
 
-                let period_masks = mask_cache.mod105_residue(a_residue, b_residue);
-                let mut step_idx = 0usize;
+                let ab = a + b;
+                let p2_base = 8 * a + 4 * b;
+                let p3_base = 27 * a + 9 * b;
+                let d3 = 6 * a;
 
-                let mut c = c_start;
-                let mut p1 = ab + c_start;
-                let mut p2 = p2_base + 2 * c_start;
-                let mut p3 = p3_base + 3 * c_start;
-                let mut p1_idx = ((p1 - 3) >> 1) as isize + 1;
-                let mut p2_idx = ((p2 - 3) >> 1) as isize + 1;
-                let mut p3_idx = ((p3 - 3) >> 1) as isize + 1;
+                if b % 3 == 0 {
+                    // Optimization 1: CRT Step-6 Pruning when b % 3 == 0
+                    // When 3 | b, P2 = -P1 (mod 3). If P1 != 0 (mod 3), {P1, P2} mod 3 covers {1, 2},
+                    // which eliminates 100% of candidate primes d >= 29 at n=1 or n=2.
+                    // Thus surviving polynomials MUST satisfy a + b + c = 0 (mod 6).
+                    // Furthermore, P1 = P2 = P3 = 0 (mod 3) identically, so mod-3 bitmask checks are bypassed!
+                    let rem = (ab + C_MIN).rem_euclid(6);
+                    let c_start = if rem == 0 { C_MIN } else { C_MIN + (6 - rem) };
 
-                while c <= C_MAX {
-                    let mask_id = unsafe { *period_masks.get_unchecked(step_idx) };
-                    let mut mask = mask_cache.value(mask_id);
-                    step_idx = if step_idx + 1 == 105 { 0 } else { step_idx + 1 };
+                    let period_masks = mask_cache.mod35_residue(a_residue, b_residue);
+                    let mut step_idx = 0usize;
 
-                    if mask != 0 {
-                        let poly = PolyCoeffs {
-                            a,
-                            b,
-                            c,
-                            d3,
-                            p1,
-                            p2,
-                            p3,
-                            p1_idx,
-                            p2_idx,
-                            p3_idx,
-                        };
+                    let mut c = c_start;
+                    let mut p1 = ab + c_start;
+                    let mut p2 = p2_base + 2 * c_start;
+                    let mut p3 = p3_base + 3 * c_start;
+                    let mut p1_idx = ((p1 - 3) >> 1) as isize + 1;
+                    let mut p2_idx = ((p2 - 3) >> 1) as isize + 1;
+                    let mut p3_idx = ((p3 - 3) >> 1) as isize + 1;
 
-                        while mask != 0 {
-                            let r = mask.trailing_zeros() as usize;
-                            mask &= mask - 1;
+                    while c <= C_MAX {
+                        counts.parity_crt_points += 1;
+                        let mask_id = unsafe { *period_masks.get_unchecked(step_idx) };
+                        let mut mask = mask_cache.value(mask_id);
+                        step_idx = if step_idx + 1 == 35 { 0 } else { step_idx + 1 };
 
-                            let start =
-                                unsafe { *buckets_ref.offsets.get_unchecked(r) } as usize;
-                            let end = unsafe { *buckets_ref.offsets.get_unchecked(r + 1) }
-                                as usize;
+                        if mask != 0 {
+                            counts.mask_surviving_points += 1;
+                            let poly = PolyCoeffs {
+                                a,
+                                b,
+                                c,
+                                d3,
+                                p1,
+                                p2,
+                                p3,
+                                p1_idx,
+                                p2_idx,
+                                p3_idx,
+                            };
 
-                            let d_slice =
-                                unsafe { buckets_ref.raw_d.get_unchecked(start..end) };
-                            let d_half_slice =
-                                unsafe { buckets_ref.d_half.get_unchecked(start..end) };
-                            evaluate_d_slice(d_slice, d_half_slice, &poly, &ctx);
-                            local_tested += d_slice.len() as u64;
+                            while mask != 0 {
+                                let r = mask.trailing_zeros() as usize;
+                                mask &= mask - 1;
+
+                                let start =
+                                    unsafe { *buckets_ref.offsets.get_unchecked(r) } as usize;
+                                let end =
+                                    unsafe { *buckets_ref.offsets.get_unchecked(r + 1) } as usize;
+
+                                let d_slice =
+                                    unsafe { buckets_ref.raw_d.get_unchecked(start..end) };
+                                let d_half_slice =
+                                    unsafe { buckets_ref.d_half.get_unchecked(start..end) };
+                                counts += evaluate_d_slice(d_slice, d_half_slice, &poly, &ctx);
+                            }
                         }
+
+                        c += 6;
+                        p1 += 6;
+                        p2 += 12;
+                        p3 += 18;
+                        p1_idx += 3;
+                        p2_idx += 6;
+                        p3_idx += 9;
                     }
+                } else {
+                    // Parity Pruning when b % 3 != 0 (c steps by 2)
+                    let c_start = if (ab & 1) == 0 {
+                        if C_MIN % 2 == 0 { C_MIN } else { C_MIN + 1 }
+                    } else {
+                        if C_MIN % 2 != 0 { C_MIN } else { C_MIN + 1 }
+                    };
 
-                    c += 2;
-                    p1 += 2;
-                    p2 += 4;
-                    p3 += 6;
-                    p1_idx += 1;
-                    p2_idx += 2;
-                    p3_idx += 3;
+                    let period_masks = mask_cache.mod105_residue(a_residue, b_residue);
+                    let mut step_idx = 0usize;
+
+                    let mut c = c_start;
+                    let mut p1 = ab + c_start;
+                    let mut p2 = p2_base + 2 * c_start;
+                    let mut p3 = p3_base + 3 * c_start;
+                    let mut p1_idx = ((p1 - 3) >> 1) as isize + 1;
+                    let mut p2_idx = ((p2 - 3) >> 1) as isize + 1;
+                    let mut p3_idx = ((p3 - 3) >> 1) as isize + 1;
+
+                    while c <= C_MAX {
+                        counts.parity_crt_points += 1;
+                        let mask_id = unsafe { *period_masks.get_unchecked(step_idx) };
+                        let mut mask = mask_cache.value(mask_id);
+                        step_idx = if step_idx + 1 == 105 { 0 } else { step_idx + 1 };
+
+                        if mask != 0 {
+                            counts.mask_surviving_points += 1;
+                            let poly = PolyCoeffs {
+                                a,
+                                b,
+                                c,
+                                d3,
+                                p1,
+                                p2,
+                                p3,
+                                p1_idx,
+                                p2_idx,
+                                p3_idx,
+                            };
+
+                            while mask != 0 {
+                                let r = mask.trailing_zeros() as usize;
+                                mask &= mask - 1;
+
+                                let start =
+                                    unsafe { *buckets_ref.offsets.get_unchecked(r) } as usize;
+                                let end =
+                                    unsafe { *buckets_ref.offsets.get_unchecked(r + 1) } as usize;
+
+                                let d_slice =
+                                    unsafe { buckets_ref.raw_d.get_unchecked(start..end) };
+                                let d_half_slice =
+                                    unsafe { buckets_ref.d_half.get_unchecked(start..end) };
+                                counts += evaluate_d_slice(d_slice, d_half_slice, &poly, &ctx);
+                            }
+                        }
+
+                        c += 2;
+                        p1 += 2;
+                        p2 += 4;
+                        p3 += 6;
+                        p1_idx += 1;
+                        p2_idx += 2;
+                        p3_idx += 3;
+                    }
                 }
-            }
 
-            TOTAL_THEORETICAL.fetch_add(theoretical_per_b, Ordering::Relaxed);
-            TOTAL_TESTED.fetch_add(local_tested, Ordering::Relaxed);
-            check_heartbeat(engine_start);
-        });
+                counts
+            })
+            .reduce(StageCounts::default, |left, right| left + right);
+
+        TOTAL_THEORETICAL.fetch_add(slice_counts.theoretical, Ordering::Relaxed);
+        TOTAL_TESTED.fetch_add(slice_counts.mask_candidates, Ordering::Relaxed);
+        check_heartbeat(engine_start);
 
         // Outer chunk (entire a block) completed: persist checkpoint with 0.00% hot-loop overhead
         save_checkpoint(a);
@@ -1996,7 +2201,7 @@ mod tests {
         assert!(is_prime_fast(&l1, &sieve, sieve_bound, v3));
 
         GLOBAL_BEST_LEN.store(0, Ordering::SeqCst);
-        verify_deep_streak(a, b, c, d, v3, &l1, &sieve, sieve_bound);
+        verify_deep_streak(a, b, c, d, v3, &l1, &sieve, sieve_bound, false);
 
         // Global best length should have been updated to 36 via bidirectional extension
         let best = GLOBAL_BEST_LEN.load(Ordering::SeqCst);
@@ -2037,6 +2242,7 @@ mod tests {
             sieve: &sieve,
             sieve_bound,
             engine_start: Instant::now(),
+            report_discoveries: false,
         };
 
         // Test 1: Exact quad (4 candidates with 8123 in second slot)
