@@ -493,7 +493,9 @@ impl<'a> CandidateAccumulator<'a> {
     pub fn flush(&mut self) {
         if self.count > 0 {
             self.target.fetch_add(self.count, Ordering::Relaxed);
-            THREAD_CANDIDATES.with(|c| c.set(c.get() + self.count));
+            if std::ptr::eq(self.target, &TOTAL_CANDIDATES) {
+                THREAD_CANDIDATES.with(|c| c.set(c.get() + self.count));
+            }
             self.count = 0;
         }
     }
@@ -572,6 +574,87 @@ pub fn format_telemetry_status(
         "[{}] Progress: {:.1}% | Total: {} ({:.2}M) | Throughput: {:.2} M/s | Current Best: {}",
         time_str, progress_pct, comma_str, total_m, throughput_m_s, best_len
     )
+}
+
+/// Atomically updates both GLOBAL_BEST_LEN and BEST_LEN with the latest streak length.
+#[inline(always)]
+pub fn update_best_streak(len: usize) {
+    let mut current_best = GLOBAL_BEST_LEN.load(Ordering::Relaxed);
+    while len > current_best {
+        match GLOBAL_BEST_LEN.compare_exchange_weak(
+            current_best,
+            len,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current_best = actual,
+        }
+    }
+    BEST_LEN.fetch_max(len, Ordering::Relaxed);
+}
+
+/// Spawns the dedicated asynchronous background telemetry monitoring thread.
+///
+/// Every 2 seconds, prints a clean formatted status update to stdout.
+/// Acquires PRINT_LOCK and LOG_MUTEX to guarantee zero interleaving or clobbering
+/// with record discovery outputs.
+pub fn spawn_telemetry_thread(engine_start: Instant) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut last_tick = Instant::now();
+        let mut last_comb = TOTAL_COMBINATIONS.load(Ordering::Relaxed);
+
+        while RUNNING.load(Ordering::Relaxed) {
+            // Sleep for 2 seconds (using 100ms slices for clean, prompt termination)
+            let sleep_interval = Duration::from_secs(2);
+            let slice = Duration::from_millis(100);
+            let slices = (sleep_interval.as_millis() / slice.as_millis()) as usize;
+            for _ in 0..slices {
+                if !RUNNING.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(slice);
+            }
+            if !RUNNING.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let now = Instant::now();
+            let dt = (now - last_tick).as_secs_f64();
+            let current_comb = TOTAL_COMBINATIONS.load(Ordering::Relaxed);
+            let delta = current_comb.saturating_sub(last_comb);
+            let throughput_m_s = if dt > 0.0 {
+                (delta as f64 / dt) / 1_000_000.0
+            } else {
+                0.0
+            };
+            last_comb = current_comb;
+            last_tick = now;
+
+            let elapsed_secs = engine_start.elapsed().as_secs();
+            let comp_a = COMPLETED_A.load(Ordering::Relaxed);
+            let tot_a = TOTAL_A.load(Ordering::Relaxed);
+            let best = GLOBAL_BEST_LEN
+                .load(Ordering::Relaxed)
+                .max(BEST_LEN.load(Ordering::Relaxed)) as u32;
+
+            let status_line = format_telemetry_status(
+                elapsed_secs,
+                comp_a,
+                tot_a,
+                current_comb,
+                throughput_m_s,
+                best,
+            );
+
+            {
+                let _lock = PRINT_LOCK.lock().unwrap();
+                let _log_lock = LOG_MUTEX.lock().unwrap();
+                println!("{}", status_line);
+                let _ = stdout().flush();
+            }
+        }
+    })
 }
 
 // ============================================================================
@@ -945,18 +1028,7 @@ pub fn verify_deep_streak(
         let total_len = curr_len + k;
 
         // Update global best length with total_len
-        let mut current_best = GLOBAL_BEST_LEN.load(Ordering::Relaxed);
-        while total_len > current_best {
-            match GLOBAL_BEST_LEN.compare_exchange_weak(
-                current_best,
-                total_len,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current_best = actual,
-            }
-        }
+        update_best_streak(total_len);
 
         if total_len >= LOCAL_RECORD_THRESHOLD && report_discoveries {
             report_discovery(final_a, final_b, final_c, final_d, total_len);
@@ -964,18 +1036,7 @@ pub fn verify_deep_streak(
         true
     } else if curr_len > 5 {
         // Update global best length live (accurate sequential reporting)
-        let mut current_best = GLOBAL_BEST_LEN.load(Ordering::Relaxed);
-        while curr_len > current_best {
-            match GLOBAL_BEST_LEN.compare_exchange_weak(
-                current_best,
-                curr_len,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current_best = actual,
-            }
-        }
+        update_best_streak(curr_len);
         false
     } else {
         false
@@ -2144,59 +2205,7 @@ fn main() {
     COMPLETED_A.store(start_a_idx, Ordering::SeqCst);
     RUNNING.store(true, Ordering::SeqCst);
 
-    let monitor_handle = std::thread::spawn(move || {
-        let mut last_tick = Instant::now();
-        let mut last_comb = TOTAL_COMBINATIONS.load(Ordering::Relaxed);
-
-        while RUNNING.load(Ordering::Relaxed) {
-            // Sleep for 2 seconds (using 100ms slices for clean, prompt termination)
-            let sleep_interval = Duration::from_secs(2);
-            let slice = Duration::from_millis(100);
-            let slices = (sleep_interval.as_millis() / slice.as_millis()) as usize;
-            for _ in 0..slices {
-                if !RUNNING.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(slice);
-            }
-            if !RUNNING.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let now = Instant::now();
-            let dt = (now - last_tick).as_secs_f64();
-            let current_comb = TOTAL_COMBINATIONS.load(Ordering::Relaxed);
-            let delta = current_comb.saturating_sub(last_comb);
-            let throughput_m_s = if dt > 0.0 {
-                (delta as f64 / dt) / 1_000_000.0
-            } else {
-                0.0
-            };
-            last_comb = current_comb;
-            last_tick = now;
-
-            let elapsed_secs = engine_start.elapsed().as_secs();
-            let comp_a = COMPLETED_A.load(Ordering::Relaxed);
-            let tot_a = TOTAL_A.load(Ordering::Relaxed);
-            let best = BEST_LEN.load(Ordering::Relaxed) as u32;
-
-            let status_line = format_telemetry_status(
-                elapsed_secs,
-                comp_a,
-                tot_a,
-                current_comb,
-                throughput_m_s,
-                best,
-            );
-
-            {
-                let _lock = PRINT_LOCK.lock().unwrap();
-                let _log_lock = LOG_MUTEX.lock().unwrap();
-                println!("{}", status_line);
-                let _ = stdout().flush();
-            }
-        }
-    });
+    let monitor_handle = spawn_telemetry_thread(engine_start);
 
     // Iterate through remaining `a` chunks in order, parallelizing `b` with Rayon
     for &a in &a_values[start_a_idx..] {
@@ -3695,28 +3704,37 @@ mod tests {
     #[test]
     fn test_telemetry_thread_spawn_and_clean_termination() {
         RUNNING.store(true, Ordering::SeqCst);
-        let test_running = std::sync::Arc::new(AtomicBool::new(true));
-        let r_clone = std::sync::Arc::clone(&test_running);
-
-        let handle = std::thread::spawn(move || {
-            let start = Instant::now();
-            while r_clone.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(10));
-                if start.elapsed() > Duration::from_secs(5) {
-                    break;
-                }
-            }
-        });
+        let handle = spawn_telemetry_thread(Instant::now());
 
         // Let the thread run for a short duration
         std::thread::sleep(Duration::from_millis(50));
-        test_running.store(false, Ordering::SeqCst);
+        RUNNING.store(false, Ordering::SeqCst);
 
         let join_res = handle.join();
         assert!(
             join_res.is_ok(),
             "Telemetry thread must terminate cleanly without panicking"
         );
+        assert!(!RUNNING.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_update_best_streak_synchronization() {
+        GLOBAL_BEST_LEN.store(39, Ordering::SeqCst);
+        BEST_LEN.store(39, Ordering::SeqCst);
+
+        update_best_streak(41);
+        assert_eq!(GLOBAL_BEST_LEN.load(Ordering::SeqCst), 41);
+        assert_eq!(BEST_LEN.load(Ordering::SeqCst), 41);
+
+        // A smaller length should not decrease the best streak
+        update_best_streak(38);
+        assert_eq!(GLOBAL_BEST_LEN.load(Ordering::SeqCst), 41);
+        assert_eq!(BEST_LEN.load(Ordering::SeqCst), 41);
+
+        // Reset back for test idempotency
+        GLOBAL_BEST_LEN.store(39, Ordering::SeqCst);
+        BEST_LEN.store(39, Ordering::SeqCst);
     }
 
     #[test]
