@@ -193,7 +193,7 @@ Runtime checkpoint and discovery logs are local files and are intentionally igno
 | `Cargo.toml` | Dependencies and optimized release profile |
 | `.cargo/config.toml` | Native CPU compilation settings |
 | `howto.md` | Quick execution reference |
-| `gemini.md` | Extended mathematical derivations and optimization notes |
+| `gemini.md` | Extended mathematical derivations and optimization notes for nerds |
 
 ## Roadmap
 
